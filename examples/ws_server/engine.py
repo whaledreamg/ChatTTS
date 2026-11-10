@@ -7,6 +7,8 @@
 
 线程模型：``Chat`` 实例非线程安全，因此本模块设计的实例只在**单个** worker
 线程中被访问，服务端通过全局队列保证串行执行。
+
+**模型与音色都从 ``configs/tts.yaml`` 读** —— 换音色 / 换模型不用改代码。
 """
 
 import os
@@ -37,11 +39,19 @@ from examples.ws_server.audio import (  # noqa: E402
     tail_decay_ms,
     trim_leading_silence,
 )
+from examples.ws_server.config import (  # noqa: E402
+    TTSServiceConfig,
+    VoiceConfig,
+    load_tts_config,
+)
 from tools.logger import get_logger  # noqa: E402
 
 logger = get_logger("TTSEngine")
 
 #: 预置音色 -> 采样 seed（沿用 examples/web/funcs.py 的表）
+#:
+#: 这是**兜底**用的 —— 配置文件 ``configs/tts.yaml`` 里定义了音色就用配置的，
+#: 没定义才用这张表。配置优先。
 VOICE_SEEDS: Dict[str, int] = {
     "Default": 2,
     "Timbre1": 1111,
@@ -152,23 +162,41 @@ def float_to_pcm16(wav: np.ndarray) -> np.ndarray:
 class TTSEngine:
     """ChatTTS 的线程安全封装（单线程独占）。"""
 
-    def __init__(self, device: Optional[str] = None, use_flash_attn: bool = False):
-        self.device = device
-        self.use_flash_attn = use_flash_attn
+    def __init__(
+        self,
+        device: Optional[str] = None,
+        use_flash_attn: bool = False,
+        config: Optional[TTSServiceConfig] = None,
+    ):
+        #: 显式传入的 device / flash_attn 优先于配置文件
+        self._device_override = device
+        self._flash_attn_override = use_flash_attn
+        self.cfg = config if config is not None else load_tts_config()
+
+        self.device: str = self._device_override or self.cfg.model.device
+        self.use_flash_attn: bool = (
+            self._flash_attn_override or self.cfg.model.use_flash_attn
+        )
         self.chat: Optional[ChatTTS.Chat] = None
+        #: 音色名 -> spk_emb 字符串
         self.spk_emb_cache: Dict[str, str] = {}
 
     # ------------------------------------------------------------------ 加载
 
     def load(self) -> bool:
-        """加载模型（本地 asset 目录）与 normalizer。"""
+        """加载模型（按配置指定的来源与设备）与 normalizer。"""
         self.chat = ChatTTS.Chat(get_logger("ChatTTS"))
+        model = self.cfg.model
         ok = self.chat.load(
-            source="local",
+            source=model.source,
+            custom_path=model.custom_path or None,
             device=torch.device(self.device) if self.device else None,
-            compile=False,
+            compile=model.compile,
             use_flash_attn=self.use_flash_attn,
-            enable_cache=True,
+            use_vllm=model.use_vllm,
+            experimental=model.experimental,
+            enable_cache=model.enable_cache,
+            coef=model.coef or None,
         )
         if not ok:
             logger.error("failed to load ChatTTS models")
@@ -193,15 +221,70 @@ class TTSEngine:
         return True
 
     def _precompute_voices(self) -> None:
-        """预先为预置音色生成 spk_emb，避免每个请求重复采样。"""
+        """预先为每个音色生成 spk_emb，避免每个请求重复采样。
+
+        两种来源：
+        - ``ref_audio``：用参考音频克隆音色（跨机器一致）
+        - ``seed``：用固定随机种子采样（同机同硬件一致）
+        """
         assert self.chat is not None
-        for name, seed in VOICE_SEEDS.items():
+
+        # 配置文件里定义的音色优先
+        voices: List[VoiceConfig] = list(self.cfg.voices)
+        if not voices:
+            # 没有配置就用内置兜底表
+            voices = [
+                VoiceConfig(name=name, seed=seed)
+                for name, seed in VOICE_SEEDS.items()
+            ]
+
+        for voice in voices:
             try:
-                torch.manual_seed(seed)
-                self.spk_emb_cache[name] = self.chat.sample_random_speaker()
-            except Exception as exc:  # pragma: no cover
-                logger.warning("sample speaker for %s failed: %s", name, exc)
-        logger.info("precomputed %d voices", len(self.spk_emb_cache))
+                emb = self._build_spk_emb(voice)
+                if emb:
+                    self.spk_emb_cache[voice.name] = emb
+            except Exception as exc:  # pragma: no cover - 单个音色失败不影响其它
+                logger.warning("build speaker for %s failed: %s", voice.name, exc)
+
+        logger.info("precomputed %d voices: %s",
+                    len(self.spk_emb_cache), ", ".join(self.spk_emb_cache))
+
+    def _build_spk_emb(self, voice: VoiceConfig) -> Optional[str]:
+        """按音色定义生成 spk_emb。
+
+        优先用参考音频克隆；失败则回落到 seed 采样。
+        """
+        assert self.chat is not None
+
+        if voice.ref_audio:
+            try:
+                emb = self._clone_from_audio(voice)
+                if emb:
+                    logger.info("voice %s: cloned from %s", voice.name, voice.ref_audio)
+                    return emb
+                logger.warning(
+                    "voice %s: 克隆失败, 回落到 seed", voice.name
+                )
+            except Exception as exc:
+                logger.warning(
+                    "voice %s: 克隆异常 (%s), 回落到 seed", voice.name, exc
+                )
+
+        if voice.seed is not None:
+            torch.manual_seed(voice.seed)
+            return self.chat.sample_random_speaker()
+
+        return None
+
+    def _clone_from_audio(self, voice: VoiceConfig) -> Optional[str]:
+        """从参考音频克隆音色。"""
+        assert self.chat is not None
+        from tools.audio import load_audio
+
+        wav, _sr = load_audio(voice.ref_audio, sr=16000)
+        import numpy as np
+
+        return self.chat.sample_audio_speaker(np.asarray(wav, dtype=np.float32))
 
     def _warmup(self) -> None:
         """预热推理链路, 让第一个真实请求不必承担初始化开销。
@@ -228,11 +311,11 @@ class TTSEngine:
                 do_homophone_replacement=True,
                 split_text=False,
                 params_infer_code=ChatTTS.Chat.InferCodeParams(
-                    spk_emb=self.resolve_spk_emb("Default", None),
-                    prompt="[speed_5]",
-                    temperature=0.3,
-                    top_P=0.7,
-                    top_K=20,
+                    spk_emb=self.resolve_spk_emb(self.cfg.defaults.voice, None),
+                    prompt=f"[speed_{self.cfg.defaults.speed}]",
+                    temperature=self.cfg.defaults.temperature,
+                    top_P=self.cfg.defaults.top_p,
+                    top_K=self.cfg.defaults.top_k,
                     stream_batch=STREAM_BATCH,
                     pass_first_n_batches=0,
                     show_tqdm=False,
@@ -247,19 +330,26 @@ class TTSEngine:
 
     @property
     def voices(self) -> List[str]:
-        return list(VOICE_SEEDS.keys())
+        return list(self.spk_emb_cache.keys())
 
     # ------------------------------------------------------------------ 合成
 
     def resolve_spk_emb(self, voice: Optional[str], spk_emb: Optional[str]) -> Optional[str]:
-        """按优先级解析说话人：显式 spk_emb > 预置 voice > 随机。"""
+        """按优先级解析说话人：显式 spk_emb > 预置 voice > 默认音色 > 随机。"""
         if spk_emb:
             return spk_emb
         if voice:
             cached = self.spk_emb_cache.get(voice)
             if cached is not None:
                 return cached
-            logger.warning("unknown voice '%s', fallback to random speaker", voice)
+            logger.warning("unknown voice '%s', fallback to default", voice)
+
+        # 客户端没给音色 / 给了不存在的音色 -> 用配置里的默认音色
+        default_voice = self.cfg.defaults.voice
+        cached = self.spk_emb_cache.get(default_voice)
+        if cached is not None:
+            return cached
+
         assert self.chat is not None
         return self.chat.sample_random_speaker()
 

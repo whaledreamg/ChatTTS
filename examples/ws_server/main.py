@@ -105,19 +105,37 @@ def _push_bytes(task: Task, payload: bytes) -> None:
 
 
 def _synthesize_pcm(task: Task):
-    """按请求参数合成，产出 PCM16 片段。"""
+    """按请求参数合成，产出 PCM16 片段。
+
+    客户端**没显式传**的字段走服务端配置 (``configs/tts.yaml`` 的
+    ``defaults`` 段) —— 这样改默认音色 / 语速只改配置, 不用改客户端。
+    """
     req = task.request
+    defaults = engine.cfg.defaults
+
+    # 客户端显式传了才用它的值, 否则用服务端默认值
+    voice = req.voice if req.provided("voice") else defaults.voice
+    speed = req.speed if req.provided("speed") else defaults.speed
+    rate = req.rate if req.provided("rate") else defaults.rate
+    lang = req.lang if req.provided("lang") else defaults.lang
+    temperature = req.temperature if req.provided("temperature") else defaults.temperature
+    top_p = req.top_p if req.provided("top_p") else defaults.top_p
+    top_k = req.top_k if req.provided("top_k") else defaults.top_k
+    refine_text = (
+        req.refine_text if req.provided("refine_text") else defaults.refine_text
+    )
+
     for wav in engine.synthesize(
         req.text,
-        voice=req.voice,
+        voice=voice,
         spk_emb=req.spk_emb,
-        speed=req.speed,
-        lang=req.lang,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        top_k=req.top_k,
-        refine_text=req.refine_text,
-        rate=req.rate,
+        speed=speed,
+        lang=lang,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        refine_text=refine_text,
+        rate=rate,
         player=player if task.play else None,
         # 默认关闭末字截断重试: 它会让首帧延迟翻 4~9 倍, 而命中率只有 ~25%。
         # 客户端可以按需显式打开。
@@ -314,6 +332,21 @@ async def health():
             "voices": engine.voices,
             "server_playback": player.available,
             "default_play": DEFAULT_PLAY,
+            # 配置信息 (方便确认「到底用的是哪个模型 / 哪个默认音色」)
+            "model": {
+                "source": engine.cfg.model.source,
+                "device": engine.device or "auto",
+                "compile": engine.cfg.model.compile,
+            },
+            "default_voice": engine.cfg.defaults.voice,
+            "defaults": {
+                "speed": engine.cfg.defaults.speed,
+                "rate": engine.cfg.defaults.rate,
+                "temperature": engine.cfg.defaults.temperature,
+                "top_p": engine.cfg.defaults.top_p,
+                "top_k": engine.cfg.defaults.top_k,
+                "lang": engine.cfg.defaults.lang,
+            },
         }
     )
 
@@ -337,6 +370,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 "voices": engine.voices,
                 "server_playback": player.available,
                 "default_play": DEFAULT_PLAY,
+                # 服务端默认音色与默认合成参数 (客户端没传就用这些)
+                "default_voice": engine.cfg.defaults.voice,
+                "defaults": {
+                    "speed": engine.cfg.defaults.speed,
+                    "rate": engine.cfg.defaults.rate,
+                    "temperature": engine.cfg.defaults.temperature,
+                    "top_p": engine.cfg.defaults.top_p,
+                    "top_k": engine.cfg.defaults.top_k,
+                    "lang": engine.cfg.defaults.lang,
+                },
             },
         )
     )

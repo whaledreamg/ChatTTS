@@ -80,7 +80,13 @@ def flags_format(flags: int) -> str:
 
 
 class TTSRequest(BaseModel):
-    """客户端发来的合成请求。"""
+    """客户端发来的合成请求。
+
+    **客户端没显式传的字段走服务端默认** (``configs/tts.yaml`` 的
+    ``defaults`` 段)。用 ``model_fields_set`` 判断哪些字段是客户端真的
+    传了的 —— 否则客户端不传 voice 时会被 pydantic 的字段默认值
+    ("Default") 盖掉服务端的配置。
+    """
 
     type: str = "tts"
     request_id: Optional[str] = None
@@ -100,6 +106,10 @@ class TTSRequest(BaseModel):
     #: 是否启用「末字截断重试」。None = 用服务端默认值（默认关闭）。
     #: 打开会让首帧延迟翻 4~9 倍，命中率只有 ~25%。
     retry_on_truncation: Optional[bool] = None
+
+    def provided(self, field: str) -> bool:
+        """客户端是否显式传了这个字段。"""
+        return field in self.model_fields_set
 
     @field_validator("text")
     @classmethod

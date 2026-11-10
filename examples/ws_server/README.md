@@ -23,16 +23,90 @@ conda run -n chattts uvicorn examples.ws_server.main:app --host 0.0.0.0 --port 8
 
 模型权重默认从仓库根目录的 `asset/` 加载（`source="local"`），无需联网。
 
-健康检查：`GET /health`
+## 配置（音色 + 模型）
+
+**音色和模型都从 `configs/tts.yaml` 读** —— 换音色 / 换模型不用改代码，
+改配置重启服务即可。
+
+```yaml
+model:
+  source: local          # local / huggingface / custom
+  custom_path: ""        # source=custom 时的模型目录
+  device: ""             # "" = 自动（有 CUDA 用 CUDA）
+  compile: false
+  use_flash_attn: false
+  enable_cache: true
+
+voices:
+  - name: Default        # 客户端写 "voice": "Default"
+    seed: 2              # 方式 1: 随机种子（同机同硬件一致）
+  - name: 客服小美
+    ref_audio: assets/voices/xiaomei.wav   # 方式 2: 参考音频克隆（跨机器一致）
+
+defaults:
+  voice: Default         # 默认音色
+  speed: 5
+  rate: 1.0              # 保音高变速倍率，>1 更快
+  temperature: 0.3
+  top_p: 0.7
+  top_k: 20
+```
+
+### 两种音色定义方式
+
+| 方式 | 字段 | 优点 | 缺点 |
+|---|---|---|---|
+| 随机种子 | `seed: 2` | 轻量、快、加载无额外开销 | **换机器 / CPU↔GPU 回退时音色会变** |
+| 参考音频克隆 | `ref_audio: xxx.wav` | **跨机器一致** | 启动时多一次 DVAE 编码，慢一点 |
+
+> 种子音色在 CPU 与 GPU 上结果不同 —— ChatTTS 的采样器 CPU/GPU 用不同的
+> 随机数流。这就是「之前重启后音色变了」的原因。要音色稳定就用
+> `ref_audio`。
+
+两个都写时：**优先克隆，失败回落到 seed**。
+
+### 客户端与服务端的优先级
+
+**客户端没显式传的字段走服务端默认值**（`configs/tts.yaml` 的 `defaults` 段）。
+
+| 字段 | 服务端默认 | 客户端覆盖 |
+|---|---|---|
+| `voice` | `defaults.voice` | 报文里带 `"voice": "Timbre3"` |
+| `speed` / `rate` | `defaults.speed` / `defaults.rate` | 报文里带 `"speed": 7` |
+| `temperature` / `top_p` / `top_k` | `defaults.*` | 报文里带 `"temperature": 0.5` |
+
+客户端传了不存在的音色 → **回落到服务端默认音色**（并记一条 WARN 日志），
+不会失败。
+
+### 查当前生效的配置
+
+```bash
+curl -s http://127.0.0.1:8000/health | python -m json.tool
+```
 
 ```json
 {"status":"ok","model_loaded":true,"queue_size":0,"sample_rate":24000,
  "voices":["Default","Timbre1", ...],
- "server_playback":true,"default_play":false}
+ "server_playback":true,"default_play":false,
+ "model":{"source":"local","device":"auto","compile":false},
+ "default_voice":"Default",
+ "defaults":{"speed":5,"rate":1.0,"temperature":0.3,"top_p":0.7,"top_k":20,"lang":null}}
 ```
 
 - `server_playback`：系统里是否可用 `aplay` / `ffplay`（决定能否本地播报）
 - `default_play`：当前是否默认对所有请求播报
+- `default_voice`：当前默认音色
+- `model`：模型来源与设备
+
+## 自检
+
+```bash
+cd services/tts_service
+conda run -n chattts python examples/ws_server/check_tts_config.py    # 配置读取 (36 项)
+conda run -n chattts python examples/ws_server/check_tts_behavior.py  # 覆盖逻辑 (23 项)
+```
+
+两个脚本都**不需要连服务、不需要加载模型**，纯离线检查。
 
 ## 测试客户端
 
